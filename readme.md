@@ -15,11 +15,13 @@ Bootloader引导设计 + Xmodem
 
 
 
-如果有问题，请留言~
+**如果有问题，请留言~**
 
 
 
+## 其他
 
+车载控制系统-IAP 是FreeRTOS+Bootloader，别人给的，我没做。
 
 
 
