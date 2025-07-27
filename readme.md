@@ -7,6 +7,7 @@
 ## Project2是基于ESP32S3的智能终端系统
 
 项目移植 + LVGL
+**有点地方有问题，待修复**
 
 ## Project3是基于Bootloader的简易课桌时钟
 
