@@ -1,0 +1,16 @@
+{
+    "idf.flashType": "UART",
+    "idf.portWin": "COM11",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "idf.openOcdConfigs": [
+        "board/esp32s3-bridge.cfg"
+    ],
+    "files.associations": {
+        "app_ui.h": "c",
+        "esp32s3.h": "c",
+        "esp_camera.h": "c",
+        "lv_font.h": "c"
+    }
+}
