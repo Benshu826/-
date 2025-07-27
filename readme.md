@@ -1,14 +1,20 @@
 # 说明
 
-Project1是基于STM32F103C8T6的智能车
+## Project1是基于STM32F103C8T6的智能车
 
-Project2是基于ESP32S3的智能终端系统
+整体内容主要是HAL库操作 + PID
 
-Project3是基于Bootloader的简易课桌时钟
+## Project2是基于ESP32S3的智能终端系统
+
+项目移植 + LVGL
+
+## Project3是基于Bootloader的简易课桌时钟
+
+Bootloader引导设计 + Xmodem
 
 
 
-如果有问题，可以联系＋V：Bigben826
+如果有问题，请留言~
 
 
 
