@@ -6,14 +6,6 @@
 
 static const char *TAG = "main";
 
-EventGroupHandle_t my_event_group;
-
-static void page_task(void *pvParameters)
-{
-    Main_Page();
-    vTaskDelete(NULL);
-}
-
 void app_main(void)
 {
     //  Initialize NVS.
@@ -31,12 +23,6 @@ void app_main(void)
     bsp_spiffs_mount();
     bsp_codec_init(); // 音频初始化
 
-    lv_gui_start(); // 显示开机界面
-    vTaskDelay(200);
-
-    my_event_group = xEventGroupCreate();
     
-    xTaskCreatePinnedToCore(page_task, "page_task", 4 * 1024, NULL, 5, NULL, 0);
-    
-
+    Main_Page();
 }

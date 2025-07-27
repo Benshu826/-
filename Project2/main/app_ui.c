@@ -3,765 +3,53 @@
 #include "esp32s3.h"
 #include "file_iterator.h"
 #include "string.h"
+#include "nvs_flash.h"
+#include "protocol_examples_common.h"
+#include "protocol_examples_utils.h"
+#include "cJSON.h"
+#include "zlib.h"
+
 #include <dirent.h>
-#include "esp_wifi.h"
+#include <time.h>
+#include <ctype.h>
+
+#include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "esp_event.h"
+#include "freertos/task.h"
+
 #include <sys/stat.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/param.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+
+#include "esp_netif.h"
+#include "esp_event.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_timer.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 
 
 static const char *TAG = "app_ui";
 LV_FONT_DECLARE(font_alipuhui20);
+LV_FONT_DECLARE(font_led);
+LV_FONT_DECLARE(font_myawesome);
+LV_FONT_DECLARE(font_qweather);
 
 lv_obj_t * main_obj; // 主界面
 lv_obj_t * main_text_label; // 主界面 欢迎语
 lv_obj_t * icon_in_obj; // 应用界面
 int icon_flag; // 标记现在进入哪个应用 在主界面时为0
 
-/*********************** 开机界面 ****************************/
-lv_obj_t * lckfb_logo;
-
-// 开机界面
-void lv_gui_start(void)
-{
-    lvgl_port_lock(0);
-    // 显示logo
-    LV_IMG_DECLARE(image_lckfb_logo);  // 声明图片
-    lckfb_logo = lv_img_create(lv_scr_act()); // 创建图片对象
-    lv_img_set_src(lckfb_logo, &image_lckfb_logo); // 设置图片对象的图片源
-    lv_obj_align(lckfb_logo, LV_ALIGN_CENTER, 0, 0); // 设置图片位置为屏幕正中心
-    lv_img_set_pivot(lckfb_logo, 60, 60); // 设置图片围绕自己的中心位置旋转   
-    lvgl_port_unlock();
-}
-
-/******************************** 第1个图标 WiFi设置 应用程序*****************************************************************************/
-
-lv_obj_t *wifi_scan_page;     // wifi扫描页面 obj
-lv_obj_t *wifi_password_page; // wifi密码页面 obj
-lv_obj_t *wifi_connect_page;  // wifi连接页面 obj
-lv_obj_t *obj_scan_title;     // wifi扫描页面标题
-lv_obj_t *label_wifi_scan;    // wif扫描页面 label
-lv_obj_t *wifi_list;          // wifi列表  list
-lv_obj_t *label_wifi_connect; // wifi连接页面label 
-lv_obj_t *ta_pass_text;       // 密码输入文本框 textarea
-lv_obj_t *roller_num;         // 数字roller
-lv_obj_t *roller_letter_low;  // 小写字母roller
-lv_obj_t *roller_letter_up;   // 大写字母roller
-lv_obj_t *label_wifi_name;    // wifi名称label
-
-
-#define DEFAULT_SCAN_LIST_SIZE   5                // 最大扫描wifi个数
-
-// wifi事件组
-static EventGroupHandle_t s_wifi_event_group = NULL;
-// wifi事件
-#define WIFI_CONNECTED_BIT    BIT0
-#define WIFI_FAIL_BIT         BIT1
-#define WIFI_START_BIT        BIT2
-#define WIFI_GET_SNTP_BIT     BIT3
-// wifi最大重连次数
-#define EXAMPLE_ESP_MAXIMUM_RETRY  3
-
-// wifi账号队列
-static QueueHandle_t xQueueWifiAccount = NULL;
-// 队列要传输的内容
-typedef struct {
-    char wifi_ssid[32];  // 获取wifi名称
-    char wifi_password[64]; // 获取wifi密码  
-    char back_flag; // 是否退出       
-} wifi_account_t;
-
-// 密码roller的遮罩显示效果
-static void mask_event_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * obj = lv_event_get_target(e);
-
-    static int16_t mask_top_id = -1;
-    static int16_t mask_bottom_id = -1;
-
-    if(code == LV_EVENT_COVER_CHECK) {
-        lv_event_set_cover_res(e, LV_COVER_RES_MASKED);
-    }
-    else if(code == LV_EVENT_DRAW_MAIN_BEGIN) {
-        /* add mask */
-        const lv_font_t * font = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
-        lv_coord_t line_space = lv_obj_get_style_text_line_space(obj, LV_PART_MAIN);
-        lv_coord_t font_h = lv_font_get_line_height(font);
-
-        lv_area_t roller_coords;
-        lv_obj_get_coords(obj, &roller_coords);
-
-        lv_area_t rect_area;
-        rect_area.x1 = roller_coords.x1;
-        rect_area.x2 = roller_coords.x2;
-        rect_area.y1 = roller_coords.y1;
-        rect_area.y2 = roller_coords.y1 + (lv_obj_get_height(obj) - font_h - line_space) / 2;
-
-        lv_draw_mask_fade_param_t * fade_mask_top = lv_mem_buf_get(sizeof(lv_draw_mask_fade_param_t));
-        lv_draw_mask_fade_init(fade_mask_top, &rect_area, LV_OPA_TRANSP, rect_area.y1, LV_OPA_COVER, rect_area.y2);
-        mask_top_id = lv_draw_mask_add(fade_mask_top, NULL);
-
-        rect_area.y1 = rect_area.y2 + font_h + line_space - 1;
-        rect_area.y2 = roller_coords.y2;
-
-        lv_draw_mask_fade_param_t * fade_mask_bottom = lv_mem_buf_get(sizeof(lv_draw_mask_fade_param_t));
-        lv_draw_mask_fade_init(fade_mask_bottom, &rect_area, LV_OPA_COVER, rect_area.y1, LV_OPA_TRANSP, rect_area.y2);
-        mask_bottom_id = lv_draw_mask_add(fade_mask_bottom, NULL);
-
-    }
-    else if(code == LV_EVENT_DRAW_POST_END) {
-        lv_draw_mask_fade_param_t * fade_mask_top = lv_draw_mask_remove_id(mask_top_id);
-        lv_draw_mask_fade_param_t * fade_mask_bottom = lv_draw_mask_remove_id(mask_bottom_id);
-        lv_draw_mask_free_param(fade_mask_top);
-        lv_draw_mask_free_param(fade_mask_bottom);
-        lv_mem_buf_release(fade_mask_top);
-        lv_mem_buf_release(fade_mask_bottom);
-        mask_top_id = -1;
-        mask_bottom_id = -1;
-    }
-}
-
-// 数字键 处理函数
-static void btn_num_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "Btn-Num Clicked");
-        char buf[2]; // 接收roller的值
-        lv_roller_get_selected_str(roller_num, buf, sizeof(buf));
-        lv_textarea_add_text(ta_pass_text, buf);
-    }
-}
-
-// 小写字母确认键 处理函数
-static void btn_letter_low_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "Btn-Letter-Low Clicked");
-        char buf[2]; // 接收roller的值
-        lv_roller_get_selected_str(roller_letter_low, buf, sizeof(buf));
-        lv_textarea_add_text(ta_pass_text, buf);
-    }
-}
-
-// 大写字母确认键 处理函数
-static void btn_letter_up_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "Btn-Letter-Up Clicked");
-        char buf[2]; // 接收roller的值
-        lv_roller_get_selected_str(roller_letter_up, buf, sizeof(buf));
-        lv_textarea_add_text(ta_pass_text, buf);
-    }
-}
-
-static void lv_wifi_connect(void)
-{
-    lv_obj_del(wifi_password_page); // 删除密码输入界面
-
-    // 创建一个面板对象
-    static lv_style_t style;
-    lv_style_init(&style);
-    lv_style_set_bg_opa( &style, LV_OPA_COVER );
-    lv_style_set_border_width(&style, 0);
-    lv_style_set_pad_all(&style, 0);
-    lv_style_set_radius(&style, 0);  
-    lv_style_set_width(&style, 320);  
-    lv_style_set_height(&style, 240); 
-
-    wifi_connect_page = lv_obj_create(lv_scr_act());
-    lv_obj_add_style(wifi_connect_page, &style, 0);
-
-    // 绘制label提示
-    label_wifi_connect = lv_label_create(wifi_connect_page);
-    lv_label_set_text(label_wifi_connect, "WLAN连接中...");
-    lv_obj_set_style_text_font(label_wifi_connect, &font_alipuhui20, 0);
-    lv_obj_align(label_wifi_connect, LV_ALIGN_CENTER, 0, -50);
-}
-
-// WiFi连接按钮 处理函数
-static void btn_connect_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "OK Clicked");
-        const char *wifi_ssid = lv_label_get_text(label_wifi_name);
-        const char *wifi_password = lv_textarea_get_text(ta_pass_text);
-        if(*wifi_password != '\0') // 判断是否为空字符串
-        {
-            wifi_account_t wifi_account;
-            strcpy(wifi_account.wifi_ssid, wifi_ssid);
-            strcpy(wifi_account.wifi_password, wifi_password);
-            ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                    wifi_account.wifi_ssid, wifi_account.wifi_password);
-            wifi_account.back_flag = 0; // 正常连接
-            lv_wifi_connect(); // 显示wifi连接界面
-            // 发送WiFi账号密码信息到队列
-            xQueueSend(xQueueWifiAccount, &wifi_account, portMAX_DELAY); 
-        }
-    }
-}
-
-// 删除密码按钮
-static void btn_del_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "Clicked");
-        lv_textarea_del_char(ta_pass_text);
-    }
-}
-
-// 返回按钮
-static void btn_back_cb(lv_event_t * e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if(code == LV_EVENT_CLICKED) {
-        ESP_LOGI(TAG, "btn_back Clicked");
-        lv_obj_del(wifi_password_page); // 删除密码输入界面
-    }
-}
-
-// 进入输入密码界面
-static void list_btn_cb(lv_event_t * e)
-{
-    // 获取点击到的WiFi名称
-    const char *wifi_name=NULL;
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * obj = lv_event_get_target(e);
-    if(code == LV_EVENT_CLICKED) {
-        wifi_name = lv_list_get_btn_text(wifi_list, obj);
-        ESP_LOGI(TAG, "WLAN Name: %s", wifi_name);
-    }
-
-    // 创建密码输入页面
-    wifi_password_page = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(wifi_password_page, 320, 240);
-    lv_obj_set_style_border_width(wifi_password_page, 0, 0); // 设置边框宽度
-    lv_obj_set_style_pad_all(wifi_password_page, 0, 0);  // 设置间隙
-    lv_obj_set_style_radius(wifi_password_page, 0, 0); // 设置圆角
-
-    // 创建返回按钮
-    lv_obj_t *btn_back = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_size(btn_back, 60, 40);
-    lv_obj_set_style_border_width(btn_back, 0, 0); // 设置边框宽度
-    lv_obj_set_style_pad_all(btn_back, 0, 0);  // 设置间隙
-    lv_obj_set_style_bg_opa(btn_back, LV_OPA_TRANSP, LV_PART_MAIN); // 背景透明
-    lv_obj_set_style_shadow_opa(btn_back, LV_OPA_TRANSP, LV_PART_MAIN); // 阴影透明
-    lv_obj_add_event_cb(btn_back, btn_back_cb, LV_EVENT_ALL, NULL); // 添加按键处理函数
-
-    lv_obj_t *label_back = lv_label_create(btn_back); 
-    lv_label_set_text(label_back, LV_SYMBOL_LEFT);  // 按键上显示左箭头符号
-    lv_obj_set_style_text_font(label_back, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(label_back, lv_color_hex(0x000000), 0); 
-    lv_obj_align(label_back, LV_ALIGN_TOP_LEFT, 10, 10);
-
-    // 显示选中的wifi名称
-    label_wifi_name = lv_label_create(wifi_password_page);
-    lv_obj_set_style_text_font(label_wifi_name, &lv_font_montserrat_14, 0);
-    lv_label_set_text(label_wifi_name, wifi_name);
-    lv_obj_align(label_wifi_name, LV_ALIGN_TOP_MID, 0, 10);
-
-    // 创建密码输入框
-    ta_pass_text = lv_textarea_create(wifi_password_page);
-    lv_obj_set_style_text_font(ta_pass_text, &lv_font_montserrat_14, 0);
-    lv_textarea_set_one_line(ta_pass_text, true);  // 一行显示
-    lv_textarea_set_password_mode(ta_pass_text, false); // 是否使用密码输入显示模式
-    lv_textarea_set_placeholder_text(ta_pass_text, "password"); // 设置提醒词
-    lv_obj_set_width(ta_pass_text, 150); // 宽度
-    lv_obj_align(ta_pass_text, LV_ALIGN_TOP_LEFT, 10, 40); // 位置
-    lv_obj_add_state(ta_pass_text, LV_STATE_FOCUSED); // 显示光标
-
-    // 创建“连接按钮”
-    lv_obj_t *btn_connect = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_connect, LV_ALIGN_TOP_LEFT, 170, 40);
-    lv_obj_set_width(btn_connect, 65); // 宽度
-    lv_obj_add_event_cb(btn_connect, btn_connect_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    lv_obj_t *label_ok = lv_label_create(btn_connect);
-    lv_label_set_text(label_ok, "OK");
-    lv_obj_set_style_text_font(label_ok, &lv_font_montserrat_14, 0);
-    lv_obj_center(label_ok);
-
-    // 创建“删除按钮”
-    lv_obj_t *btn_del = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_del, LV_ALIGN_TOP_LEFT, 245, 40);
-    lv_obj_set_width(btn_del, 65); // 宽度
-    lv_obj_add_event_cb(btn_del, btn_del_cb, LV_EVENT_ALL, NULL);  // 事件处理函数
-
-    lv_obj_t *label_del = lv_label_create(btn_del);
-    lv_label_set_text(label_del, LV_SYMBOL_BACKSPACE);
-    lv_obj_set_style_text_font(label_del, &lv_font_montserrat_14, 0);
-    lv_obj_center(label_del);
-
-    // 创建roller样式
-    static lv_style_t style;
-    lv_style_init(&style);
-    lv_style_set_bg_color(&style, lv_color_black());
-    lv_style_set_text_color(&style, lv_color_white());
-    lv_style_set_border_width(&style, 0);
-    lv_style_set_pad_all(&style, 0);
-    lv_style_set_radius(&style, 0);
-
-    // 创建"数字"roller
-    const char * opts_num = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
-
-    roller_num = lv_roller_create(wifi_password_page);
-    lv_obj_add_style(roller_num, &style, 0);
-    lv_obj_set_style_bg_opa(roller_num, LV_OPA_50, LV_PART_SELECTED);
-
-    lv_roller_set_options(roller_num, opts_num, LV_ROLLER_MODE_INFINITE);
-    lv_roller_set_visible_row_count(roller_num, 3); // 显示3行
-    lv_roller_set_selected(roller_num, 5, LV_ANIM_OFF); // 默认选择
-    lv_obj_set_width(roller_num, 90);
-    lv_obj_set_style_text_font(roller_num, &lv_font_montserrat_14, 0);
-    lv_obj_align(roller_num, LV_ALIGN_BOTTOM_LEFT, 15, -53);
-    lv_obj_add_event_cb(roller_num, mask_event_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    // 创建"数字"roller 的确认键
-    lv_obj_t *btn_num_ok = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_num_ok, LV_ALIGN_BOTTOM_LEFT, 15, -10); // 位置
-    lv_obj_set_width(btn_num_ok, 90); // 宽度
-    lv_obj_add_event_cb(btn_num_ok, btn_num_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    lv_obj_t *label_num_ok = lv_label_create(btn_num_ok);
-    lv_label_set_text(label_num_ok, LV_SYMBOL_OK);
-    lv_obj_set_style_text_font(label_num_ok, &lv_font_montserrat_14, 0);
-    lv_obj_center(label_num_ok);
-
-    // 创建"小写字母"roller
-    const char * opts_letter_low = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz";
-
-    roller_letter_low = lv_roller_create(wifi_password_page);
-    lv_obj_add_style(roller_letter_low, &style, 0);
-    lv_obj_set_style_bg_opa(roller_letter_low, LV_OPA_50, LV_PART_SELECTED); // 设置选中项的透明度
-    lv_roller_set_options(roller_letter_low, opts_letter_low, LV_ROLLER_MODE_INFINITE); // 循环滚动模式
-    lv_roller_set_visible_row_count(roller_letter_low, 3);
-    lv_roller_set_selected(roller_letter_low, 15, LV_ANIM_OFF); // 
-    lv_obj_set_width(roller_letter_low, 90);
-    lv_obj_set_style_text_font(roller_letter_low, &lv_font_montserrat_14, 0);
-    lv_obj_align(roller_letter_low, LV_ALIGN_BOTTOM_LEFT, 115, -53);
-    lv_obj_add_event_cb(roller_letter_low, mask_event_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    // 创建"小写字母"roller的确认键
-    lv_obj_t *btn_letter_low_ok = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_letter_low_ok, LV_ALIGN_BOTTOM_LEFT, 115, -10);
-    lv_obj_set_width(btn_letter_low_ok, 90); // 宽度
-    lv_obj_add_event_cb(btn_letter_low_ok, btn_letter_low_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    lv_obj_t *label_letter_low_ok = lv_label_create(btn_letter_low_ok);
-    lv_label_set_text(label_letter_low_ok, LV_SYMBOL_OK);
-    lv_obj_set_style_text_font(label_letter_low_ok, &lv_font_montserrat_14, 0);
-    lv_obj_center(label_letter_low_ok);
-
-    // 创建"大写字母"roller
-    const char * opts_letter_up = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP\nQ\nR\nS\nT\nU\nV\nW\nX\nY\nZ";
-
-    roller_letter_up = lv_roller_create(wifi_password_page);
-    lv_obj_add_style(roller_letter_up, &style, 0);
-    lv_obj_set_style_bg_opa(roller_letter_up, LV_OPA_50, LV_PART_SELECTED); // 设置选中项的透明度
-    lv_roller_set_options(roller_letter_up, opts_letter_up, LV_ROLLER_MODE_INFINITE); // 循环滚动模式
-    lv_roller_set_visible_row_count(roller_letter_up, 3);
-    lv_roller_set_selected(roller_letter_up, 15, LV_ANIM_OFF);
-    lv_obj_set_width(roller_letter_up, 90);
-    lv_obj_set_style_text_font(roller_letter_up, &lv_font_montserrat_14, 0);
-    lv_obj_align(roller_letter_up, LV_ALIGN_BOTTOM_LEFT, 215, -53);
-    lv_obj_add_event_cb(roller_letter_up, mask_event_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    // 创建"大写字母"roller的确认键
-    lv_obj_t *btn_letter_up_ok = lv_btn_create(wifi_password_page);
-    lv_obj_align(btn_letter_up_ok, LV_ALIGN_BOTTOM_LEFT, 215, -10);
-    lv_obj_set_width(btn_letter_up_ok, 90); 
-    lv_obj_add_event_cb(btn_letter_up_ok, btn_letter_up_cb, LV_EVENT_ALL, NULL); // 事件处理函数
-
-    lv_obj_t *label_letter_up_ok = lv_label_create(btn_letter_up_ok);
-    lv_label_set_text(label_letter_up_ok, LV_SYMBOL_OK);
-    lv_obj_set_style_text_font(label_letter_up_ok, &lv_font_montserrat_14, 0);
-    lv_obj_center(label_letter_up_ok);
-
-}
-
-lv_obj_t * date_label;
-lv_obj_t * time_label;
-
-time_t now;
-struct tm timeinfo;
-
-// 更新时间函数
-void value_update_cb(lv_timer_t * timer)
-{
-    // 更新日期 星期 时分秒
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    lv_label_set_text_fmt(time_label, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    lv_label_set_text_fmt(date_label, "%d年%02d月%02d日", timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday);
-}
-
-// 获得日期时间 任务函数
-static void get_time_task(void *pvParameters)
-{
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("cn.pool.ntp.org");
-    esp_netif_sntp_init(&config);
-    // wait for time to be set
-    int retry = 0;
-    // const int retry_count = 6;
-    while (esp_netif_sntp_sync_wait(2000 / portTICK_PERIOD_MS) == ESP_ERR_TIMEOUT) {
-        ESP_LOGI(TAG, "Waiting for system time to be set... (%d)", retry++);
-    }
-
-    esp_netif_sntp_deinit();
-    // 设置时区
-    setenv("TZ", "CST-8", 1); 
-    tzset();
-    // 获取系统时间
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    lvgl_port_lock(0);
-    lv_obj_del(main_text_label); // 删除主页的欢迎语 
-    // 显示年月日
-    date_label = lv_label_create(main_obj);
-    lv_obj_set_style_text_font(date_label, &font_alipuhui20, 0);
-    lv_obj_set_style_text_color(date_label, lv_color_hex(0xffffff), 0); 
-    lv_label_set_text_fmt(date_label, "%d年%02d月%02d日", timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday);
-    lv_obj_align(date_label, LV_ALIGN_TOP_LEFT, 10, 5);
-
-    // 显示时间  小时:分钟:秒钟
-    time_label = lv_label_create(main_obj);
-    lv_obj_set_style_text_font(time_label, &font_alipuhui20, 0);
-    lv_obj_set_style_text_color(time_label, lv_color_hex(0xffffff), 0); 
-    lv_label_set_text_fmt(time_label, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    lv_obj_align_to(time_label, date_label, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
-    lvgl_port_unlock();
-
-    xEventGroupSetBits(s_wifi_event_group, WIFI_GET_SNTP_BIT);
-
-    lv_timer_create(value_update_cb, 1000, NULL);  // 创建一个lv_timer 每秒更新一次时间
-    
-    vTaskDelete(NULL);
-}
-
-// 网络连接 事件处理函数
-static void event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
-{
-    static int s_retry_num = 0;
-
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_START_BIT);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG,"connect to the AP fail");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-esp_event_handler_instance_t instance_any_id;
-esp_event_handler_instance_t instance_got_ip;
-esp_netif_t *sta_netif = NULL;
-
-// 扫描附近wifi
-static void wifi_scan(wifi_ap_record_t ap_info[], uint16_t *ap_number)
-{
-    s_wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    sta_netif = esp_netif_create_default_wifi_sta();
-    assert(sta_netif);
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-    
-    uint16_t ap_count = 0;
-    
-    memset(ap_info, 0, *ap_number * sizeof(wifi_ap_record_t));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_scan_start(NULL, true);
-
-    ESP_LOGI(TAG, "Max AP number ap_info can hold = %u", *ap_number);
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));  // 获取扫描到的wifi数量
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(ap_number, ap_info)); // 获取真实的获取到wifi数量和信息
-    ESP_LOGI(TAG, "Total APs scanned = %u, actual AP number ap_info holds = %u", ap_count, *ap_number);
-}
-
-// 清除wifi初始化内容
-static void wifiset_deinit(void)
-{
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &instance_got_ip));
-    esp_err_t err = esp_wifi_stop();
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        return;
-    }
-    ESP_ERROR_CHECK(err);
-    ESP_ERROR_CHECK(esp_wifi_deinit());
-    ESP_ERROR_CHECK(esp_wifi_clear_default_wifi_driver_and_handlers(sta_netif));
-    esp_netif_destroy(sta_netif);
-    sta_netif = NULL;
-    ESP_ERROR_CHECK(esp_event_loop_delete_default());
-}
-
-// WIFI连接任务
-static void wifi_connect(void *arg)
-{
-    wifi_account_t wifi_account;
-
-    while (true)
-    {
-        // 如果收到wifi账号队列消息
-        if(xQueueReceive(xQueueWifiAccount, &wifi_account, portMAX_DELAY))
-        {
-            if (wifi_account.back_flag == 1){  // 退出任务标志
-                break; // 跳出while循环
-            }
-            
-            wifi_config_t wifi_config = {
-                .sta = {
-                    .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-                    .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-                    .sae_h2e_identifier = "",
-                    },
-            };
-            strcpy((char *)wifi_config.sta.ssid, wifi_account.wifi_ssid);
-            strcpy((char *)wifi_config.sta.password, wifi_account.wifi_password);
-            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-            esp_wifi_connect();
-            /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-            * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-            EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-            /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-            * happened. */
-            if (bits & WIFI_CONNECTED_BIT) {
-                ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", wifi_config.sta.ssid, wifi_config.sta.password);
-                lvgl_port_lock(0);
-                lv_label_set_text(label_wifi_connect, "WLAN 连接成功");
-                lvgl_port_unlock();
-                vTaskDelay(1000 / portTICK_PERIOD_MS); // 给上面的显示一点时间
-                lvgl_port_lock(0);
-                lv_obj_del(wifi_connect_page); // 删除此页面
-                lv_obj_del(wifi_scan_page); // 删除此页面
-                lvgl_port_unlock();
-                vQueueDelete(xQueueWifiAccount); // 删除队列
-                icon_flag = 0; // 标记回到主界面
-                xTaskCreatePinnedToCore(get_time_task, "get_time_task", 2 * 1024, NULL, 5, NULL, 0);  // 创建获取时间任务
-                break; // 跳出while循环删除任务
-            } else if (bits & WIFI_FAIL_BIT) {
-                ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s", wifi_config.sta.ssid, wifi_config.sta.password);
-                lvgl_port_lock(0);
-                lv_label_set_text(label_wifi_connect, "WLAN 连接失败");
-                lvgl_port_unlock();
-                vTaskDelay(1000 / portTICK_PERIOD_MS); // 给上面的显示一点时间
-                lvgl_port_lock(0);
-                lv_obj_del(wifi_connect_page); // 删除此页面
-                lvgl_port_unlock();
-                xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT); // 清除此事件标志位
-
-            } else {
-                ESP_LOGE(TAG, "UNEXPECTED EVENT");
-                lvgl_port_lock(0);
-                lv_label_set_text(label_wifi_connect, "WLAN 连接异常");
-                lvgl_port_unlock();
-                vTaskDelay(1000 / portTICK_PERIOD_MS); // 给上面的显示一点时间
-                lvgl_port_lock(0);
-                lv_obj_del(wifi_connect_page); // 删除此页面
-                lv_obj_del(wifi_scan_page); // 删除此页面
-                lvgl_port_unlock();
-                wifiset_deinit(); // 清除wifi初始化
-            }
-        }
-    }
-    vTaskDelete(NULL);
-}
-
-// 返回主界面按钮事件处理函数
-static void btn_backmain_cb(lv_event_t * e)
-{
-    ESP_LOGI(TAG, "btn_backmain Clicked");
-
-    // // 删除wifi扫描界面
-    lvgl_port_lock(0);
-    lv_obj_del(wifi_scan_page); 
-    lvgl_port_unlock();
-
-    // 通知wifi_connect任务退出
-    wifi_account_t wifi_account;
-    wifi_account.back_flag = 1; 
-    xQueueSend(xQueueWifiAccount, &wifi_account, portMAX_DELAY); 
-    
-    wifiset_deinit();// 清除wifi扫描痕迹
-    vQueueDelete(xQueueWifiAccount); // 删除队列
-    icon_flag = 0;
-}
-
-// wifi连接
-void app_wifi_connect(void *arg)
-{
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    // 扫描WLAN信息
-    wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];  // 记录扫描到的wifi信息
-    uint16_t ap_number = DEFAULT_SCAN_LIST_SIZE; 
-    wifi_scan(ap_info, &ap_number); // 扫描附近wifi
-
-    lvgl_port_lock(0);
-    // 修改标题
-    lv_label_set_text_fmt(label_wifi_scan, "%d WLAN", ap_number);
-
-    // 创建返回按钮
-    lv_obj_t *btn_back = lv_btn_create(obj_scan_title);
-    lv_obj_align(btn_back, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_size(btn_back, 60, 30);
-    lv_obj_set_style_border_width(btn_back, 0, 0); // 设置边框宽度
-    lv_obj_set_style_pad_all(btn_back, 0, 0);  // 设置间隙
-    lv_obj_set_style_bg_opa(btn_back, LV_OPA_TRANSP, LV_PART_MAIN); // 背景透明
-    lv_obj_set_style_shadow_opa(btn_back, LV_OPA_TRANSP, LV_PART_MAIN); // 阴影透明
-    lv_obj_add_event_cb(btn_back, btn_backmain_cb, LV_EVENT_CLICKED, NULL); // 添加按键处理函数
-
-    lv_obj_t *label_back = lv_label_create(btn_back); 
-    lv_label_set_text(label_back, LV_SYMBOL_LEFT);  // 按键上显示左箭头符号
-    lv_obj_set_style_text_font(label_back, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(label_back, lv_color_hex(0xffffff), 0); 
-    lv_obj_align(label_back, LV_ALIGN_CENTER, -10, 0);
-
-    // 创建wifi信息列表
-    wifi_list = lv_list_create(wifi_scan_page);
-    lv_obj_set_size(wifi_list, 320, 200);
-    lv_obj_align(wifi_list, LV_ALIGN_TOP_LEFT, 0, 40);
-    lv_obj_set_style_border_width(wifi_list, 0, 0);
-    lv_obj_set_style_text_font(wifi_list, &font_alipuhui20, 0);
-    lv_obj_set_scrollbar_mode(wifi_list, LV_SCROLLBAR_MODE_OFF); // 隐藏wifi_list滚动条
-    // 显示wifi信息
-    lv_obj_t * btn;
-    for (int i = 0; i < ap_number; i++) {
-        ESP_LOGI(TAG, "SSID \t\t%s", ap_info[i].ssid);  // 终端输出wifi名称
-        ESP_LOGI(TAG, "RSSI \t\t%d", ap_info[i].rssi);  // 终端输出wifi信号质量
-        // 添加wifi列表
-        btn = lv_list_add_btn(wifi_list, LV_SYMBOL_WIFI, (const char *)ap_info[i].ssid); 
-        lv_obj_add_event_cb(btn, list_btn_cb, LV_EVENT_CLICKED, NULL); // 添加点击回调函数
-    }
-    lvgl_port_unlock();
-    
-    // 创建wifi连接任务
-    xQueueWifiAccount = xQueueCreate(2, sizeof(wifi_account_t));
-    xTaskCreatePinnedToCore(wifi_connect, "wifi_connect", 4 * 1024, NULL, 5, NULL, 1);  // 创建wifi连接任务
-    vTaskDelete(NULL);
-}
-
-//  任务函数
-static void wifiset_tips_task(void *pvParameters)
-{
-    // 显示扫描情况
-    lvgl_port_lock(0);
-    label_wifi_scan = lv_label_create(wifi_scan_page);
-    lv_label_set_text(label_wifi_scan, "WLAN 已连接");
-    lv_obj_set_style_text_color(label_wifi_scan, lv_color_hex(0x000000), 0); 
-    lv_obj_set_style_text_font(label_wifi_scan, &font_alipuhui20, 0);
-    lv_obj_align(label_wifi_scan, LV_ALIGN_CENTER, 0, -50);
-    lvgl_port_unlock();
-    vTaskDelay(500 / portTICK_PERIOD_MS); 
-    lvgl_port_lock(0);
-    lv_obj_del(wifi_scan_page);
-    lvgl_port_unlock();
-
-    vTaskDelete(NULL);
-}
-
-// 进入WIFI设置应用
-static void wifiset_event_handler(lv_event_t * e)
-{  
-    // 创建一个界面对象
-    static lv_style_t style;
-    lv_style_init(&style);
-    lv_style_set_radius(&style, 10);  
-    lv_style_set_bg_opa( &style, LV_OPA_COVER );
-    lv_style_set_bg_color(&style, lv_color_hex(0xFFFFFF));
-    lv_style_set_border_width(&style, 0);
-    lv_style_set_pad_all(&style, 0);
-    lv_style_set_width(&style, 320);  
-    lv_style_set_height(&style, 240); 
-
-    wifi_scan_page = lv_obj_create(lv_scr_act());
-    lv_obj_add_style(wifi_scan_page, &style, 0);
-
-    // 判断wifi是否已连接
-    int isconnect_flag = 1;
-    if (s_wifi_event_group != NULL) // 如果创建了此事件组
-    {
-        // 查看是否已经连接wifi
-        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, 10);
-        if (bits & WIFI_CONNECTED_BIT) { // 如果已经连接到wifi
-            xTaskCreatePinnedToCore(wifiset_tips_task, "wifiset_tips_task", 2048, NULL, 5, NULL, 0);
-        }
-        else{
-            isconnect_flag = 0;
-        } 
-    }
-    if (s_wifi_event_group == NULL || isconnect_flag == 0) // 没有连接到wifi
-    {
-        // 创建标题背景
-        obj_scan_title = lv_obj_create(wifi_scan_page);
-        lv_obj_set_size(obj_scan_title, 320, 40);
-        lv_obj_set_style_pad_all(obj_scan_title, 0, 0);  // 设置间隙
-        lv_obj_align(obj_scan_title, LV_ALIGN_TOP_LEFT, 0, 0);
-        lv_obj_set_style_bg_color(obj_scan_title, lv_color_hex(0x008b8b), 0);
-        // 显示扫描情况
-        label_wifi_scan = lv_label_create(obj_scan_title);
-        lv_label_set_text(label_wifi_scan, "WLAN扫描中...");
-        lv_obj_set_style_text_color(label_wifi_scan, lv_color_hex(0xffffff), 0); 
-        lv_obj_set_style_text_font(label_wifi_scan, &font_alipuhui20, 0);
-        lv_obj_align(label_wifi_scan, LV_ALIGN_CENTER, 0, 0);
-
-        icon_flag = 1; // 标记已经进入第5个应用
-
-        xTaskCreatePinnedToCore(app_wifi_connect, "app_wifi_connect", 4*1024, NULL, 5, NULL, 0);
-    }
-}
-
-/******************************** 第2个图标 音乐播放器 应用程序*****************************************************************************/
+/********************************************************* 第1个图标 音乐播放器 应用程序*****************************************************************************/
 static audio_player_config_t player_config = {0};
 static uint8_t g_sys_volume = VOLUME_DEFAULT;
 static file_iterator_instance_t *file_iterator = NULL;
@@ -884,7 +172,6 @@ typedef struct {
     lv_style_t style_bg;
     lv_style_t style_focus_no_outline;
 } button_style_t;
-
 static button_style_t g_btn_styles;
 
 button_style_t *ui_button_styles(void)
@@ -1170,18 +457,443 @@ static void music_event_handler(lv_event_t * e)
     lv_obj_set_style_text_color(label_back, lv_color_hex(0xffffff), 0); 
     lv_obj_align(label_back, LV_ALIGN_CENTER, -10, 0);
 
-    icon_flag = 2; // 标记已经进入第二个应用
+    icon_flag = 1; // 标记已经进入第二个应用
 
     music_ui(); // 音乐播放器界面
 }
 
+/******************************** 第2个图标 天气预报 应用程序*****************************************************************************/
+
+#define WIFI_CONNECTED_BIT          BIT0
+#define WIFI_GET_SNTP_BIT           BIT1
+#define WIFI_GET_DAILYWEATHER_BIT   BIT2
+#define WIFI_GET_RTWEATHER_BIT      BIT3
+#define WIFI_GET_WEATHER_BIT        BIT4
+
+#define MAX_HTTP_OUTPUT_BUFFER      2048
+
+#define QWEATHER_DAILY_URL   "https://m63aank2w7.re.qweatherapi.com/v7/weather/3d?&location=101190104&key=ef08fe8570eb4a6591c88addf1af8db0"
+#define QWEATHER_NOW_URL     "https://m63aank2w7.re.qweatherapi.com/v7/weather/now?location=101190104&key=ef08fe8570eb4a6591c88addf1af8db0"
+#define QAIR_NOW_URL         "https://m63aank2w7.re.qweatherapi.com/v7/air/now?&location=101190104&key=ef08fe8570eb4a6591c88addf1af8db0"
+
+lv_obj_t *weather_main_page;
+
+lv_obj_t * label_wifi;
+lv_obj_t * label_sntp;
+lv_obj_t * label_weather;
+lv_obj_t * qweather_icon_label;
+lv_obj_t * qweather_temp_label;
+lv_obj_t * qweather_text_label;
+lv_obj_t * qair_level_obj;
+lv_obj_t * qair_level_label;
+lv_obj_t * led_time_label;
+lv_obj_t * week_label;
+lv_obj_t * sunset_label;
+lv_obj_t *indoor_temp_label;
+lv_obj_t *indoor_humi_label;
+lv_obj_t *outdoor_temp_label;
+lv_obj_t *outdoor_humi_label;
+lv_obj_t * date_label;
+
+float temp, humi;
+
+int reset_flag;
+int th_update_flag;
+int qwnow_update_flag;
+int qair_update_flag;
+int qwdaily_update_flag;
+
+static EventGroupHandle_t weather_event_group;
+
+time_t now;
+struct tm timeinfo;
+
+int temp_value, humi_value;
+
+int qwnow_temp;             // 实时天气温度
+int qwnow_humi;             // 实时天气湿度
+int qwnow_icon;             // 实时天气图标
+char qwnow_text[32];        // 实时天气状态
+
+int qwdaily_tempMax;        // 当天最高温度
+int qwdaily_tempMin;        // 当天最低温度
+char qwdaily_sunrise[10];   // 当天日出时间
+char qwdaily_sunset[10];    // 当天日落时间
+
+int qanow_level;            // 实时空气质量等级
+
+// 返回主界面按钮事件处理函数
+static void btn_th_backmain_cb(lv_event_t * e)
+{
+    ESP_LOGI(TAG, "btn_backmain Clicked");
+    lv_obj_del(icon_in_obj);
+    icon_flag = 0;
+}
+// 显示天气图标
+void lv_qweather_icon_show(void)
+{
+    switch (qwnow_icon)
+    {
+        case 100: lv_label_set_text(qweather_icon_label, "\xEF\x84\x81"); strcpy(qwnow_text, "晴"); break;
+        case 101: lv_label_set_text(qweather_icon_label, "\xEF\x84\x82"); strcpy(qwnow_text, "多云"); break;
+        case 102: lv_label_set_text(qweather_icon_label, "\xEF\x84\x83"); strcpy(qwnow_text, "少云"); break;
+        case 103: lv_label_set_text(qweather_icon_label, "\xEF\x84\x84"); strcpy(qwnow_text, "晴间多云"); break;
+        case 104: lv_label_set_text(qweather_icon_label, "\xEF\x84\x85"); strcpy(qwnow_text, "阴"); break;
+        case 150: lv_label_set_text(qweather_icon_label, "\xEF\x84\x86"); strcpy(qwnow_text, "晴"); break;
+        case 151: lv_label_set_text(qweather_icon_label, "\xEF\x84\x87"); strcpy(qwnow_text, "多云"); break;
+        case 152: lv_label_set_text(qweather_icon_label, "\xEF\x84\x88"); strcpy(qwnow_text, "少云"); break;
+        case 153: lv_label_set_text(qweather_icon_label, "\xEF\x84\x89"); strcpy(qwnow_text, "晴间多云"); break;
+        case 300: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8A"); strcpy(qwnow_text, "阵雨"); break;
+        case 301: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8B"); strcpy(qwnow_text, "强阵雨"); break;
+        case 302: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8C"); strcpy(qwnow_text, "雷阵雨"); break;
+        case 303: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8D"); strcpy(qwnow_text, "强雷阵雨"); break;
+        case 304: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8E"); strcpy(qwnow_text, "雷阵雨伴有冰雹"); break;
+        case 305: lv_label_set_text(qweather_icon_label, "\xEF\x84\x8F"); strcpy(qwnow_text, "小雨"); break;
+        case 306: lv_label_set_text(qweather_icon_label, "\xEF\x84\x90"); strcpy(qwnow_text, "中雨"); break;
+        case 307: lv_label_set_text(qweather_icon_label, "\xEF\x84\x91"); strcpy(qwnow_text, "大雨"); break;
+        case 308: lv_label_set_text(qweather_icon_label, "\xEF\x84\x92"); strcpy(qwnow_text, "极端降雨"); break;
+        case 309: lv_label_set_text(qweather_icon_label, "\xEF\x84\x93"); strcpy(qwnow_text, "毛毛雨"); break;
+        case 310: lv_label_set_text(qweather_icon_label, "\xEF\x84\x94"); strcpy(qwnow_text, "暴雨"); break;
+        case 311: lv_label_set_text(qweather_icon_label, "\xEF\x84\x95"); strcpy(qwnow_text, "大暴雨"); break;
+        case 312: lv_label_set_text(qweather_icon_label, "\xEF\x84\x96"); strcpy(qwnow_text, "特大暴雨"); break;
+        case 313: lv_label_set_text(qweather_icon_label, "\xEF\x84\x97"); strcpy(qwnow_text, "冻雨"); break;
+        case 314: lv_label_set_text(qweather_icon_label, "\xEF\x84\x98"); strcpy(qwnow_text, "小到中雨"); break;
+        case 315: lv_label_set_text(qweather_icon_label, "\xEF\x84\x99"); strcpy(qwnow_text, "中到大雨"); break;
+        case 316: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9A"); strcpy(qwnow_text, "大到暴雨"); break;
+        case 317: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9B"); strcpy(qwnow_text, "暴雨到大暴雨"); break;
+        case 318: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9C"); strcpy(qwnow_text, "大暴雨到特大暴雨"); break;
+        case 350: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9D"); strcpy(qwnow_text, "阵雨"); break;
+        case 351: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9E"); strcpy(qwnow_text, "强阵雨"); break;
+        case 399: lv_label_set_text(qweather_icon_label, "\xEF\x84\x9F"); strcpy(qwnow_text, "雨"); break;
+        case 400: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA0"); strcpy(qwnow_text, "小雪"); break;
+        case 401: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA1"); strcpy(qwnow_text, "中雪"); break;
+        case 402: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA2"); strcpy(qwnow_text, "大雪"); break;
+        case 403: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA3"); strcpy(qwnow_text, "暴雪"); break;
+        case 404: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA4"); strcpy(qwnow_text, "雨夹雪"); break;
+        case 405: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA5"); strcpy(qwnow_text, "雨雪天气"); break;
+        case 406: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA6"); strcpy(qwnow_text, "阵雨夹雪"); break;
+        case 407: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA7"); strcpy(qwnow_text, "阵雪"); break;
+        case 408: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA8"); strcpy(qwnow_text, "小到中雪"); break;
+        case 409: lv_label_set_text(qweather_icon_label, "\xEF\x84\xA9"); strcpy(qwnow_text, "中到大雪"); break;
+        case 410: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAA"); strcpy(qwnow_text, "大到暴雪"); break;
+        case 456: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAB"); strcpy(qwnow_text, "阵雨夹雪"); break;
+        case 457: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAC"); strcpy(qwnow_text, "阵雪"); break;
+        case 499: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAD"); strcpy(qwnow_text, "雪"); break;
+        case 500: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAE"); strcpy(qwnow_text, "薄雾"); break;
+        case 501: lv_label_set_text(qweather_icon_label, "\xEF\x84\xAF"); strcpy(qwnow_text, "雾"); break;
+        case 502: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB0"); strcpy(qwnow_text, "霾"); break;
+        case 503: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB1"); strcpy(qwnow_text, "扬沙"); break;
+        case 504: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB2"); strcpy(qwnow_text, "浮尘"); break;
+        case 507: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB3"); strcpy(qwnow_text, "沙尘暴"); break;
+        case 508: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB4"); strcpy(qwnow_text, "强沙尘暴"); break;
+        case 509: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB5"); strcpy(qwnow_text, "浓雾"); break;
+        case 510: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB6"); strcpy(qwnow_text, "强浓雾"); break;
+        case 511: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB7"); strcpy(qwnow_text, "中度霾"); break;
+        case 512: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB8"); strcpy(qwnow_text, "重度霾"); break;
+        case 513: lv_label_set_text(qweather_icon_label, "\xEF\x84\xB9"); strcpy(qwnow_text, "严重霾"); break;
+        case 514: lv_label_set_text(qweather_icon_label, "\xEF\x84\xBA"); strcpy(qwnow_text, "大雾"); break;
+        case 515: lv_label_set_text(qweather_icon_label, "\xEF\x84\xBB"); strcpy(qwnow_text, "特强浓雾"); break;
+        case 900: lv_label_set_text(qweather_icon_label, "\xEF\x85\x84"); strcpy(qwnow_text, "热"); break;
+        case 901: lv_label_set_text(qweather_icon_label, "\xEF\x85\x85"); strcpy(qwnow_text, "冷"); break;
+    
+        default:
+            printf("ICON_CODE:%d\n", qwnow_icon);
+            lv_label_set_text(qweather_icon_label, "\xEF\x85\x86");
+            strcpy(qwnow_text, "未知天气");
+            break;
+    }
+}
+
+// 显示空气质量
+void lv_qair_level_show(void)
+{
+    switch (qanow_level)
+    {
+        case 1: 
+            lv_label_set_text(qair_level_label, "优"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_GREEN), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0);
+            break;
+        case 2: 
+            lv_label_set_text(qair_level_label, "良"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_YELLOW), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0x000000), 0);
+            break;
+        case 3: 
+            lv_label_set_text(qair_level_label, "轻");
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_ORANGE), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0); 
+            break;
+        case 4: 
+            lv_label_set_text(qair_level_label, "中"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_RED), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0);
+            break; 
+        case 5: 
+            lv_label_set_text(qair_level_label, "重"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_PURPLE), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0);
+            break;
+        case 6: 
+            lv_label_set_text(qair_level_label, "严"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_BROWN), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0);
+            break;
+        default: 
+            lv_label_set_text(qair_level_label, "未"); 
+            lv_obj_set_style_bg_color(qair_level_obj, lv_palette_main(LV_PALETTE_GREEN), 0); 
+            lv_obj_set_style_text_color(qair_level_label, lv_color_hex(0xFFFFFF), 0);
+            break;
+    }
+}
+
+// 显示星期几
+void lv_week_show(void)
+{
+    switch (timeinfo.tm_wday)
+    {
+        case 0: lv_label_set_text(week_label, "星期日"); break;
+        case 1: lv_label_set_text(week_label, "星期一"); break;
+        case 2: lv_label_set_text(week_label, "星期二"); break;
+        case 3: lv_label_set_text(week_label, "星期三"); break;
+        case 4: lv_label_set_text(week_label, "星期四"); break; 
+        case 5: lv_label_set_text(week_label, "星期五"); break;
+        case 6: lv_label_set_text(week_label, "星期六"); break;
+        default: lv_label_set_text(week_label, "星期日"); break;
+    }
+}
+
+// 显示weather界面
+void lv_weather_page(void)
+{
+    lvgl_port_lock(0);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), 0); // 修改背景为黑色
+    static lv_style_t style;
+    lv_style_init(&style);
+    lv_style_set_radius(&style, 10);  // 设置圆角半径
+    lv_style_set_bg_opa( &style, LV_OPA_COVER );
+    lv_style_set_bg_color(&style, lv_color_hex(0x00BFFF));
+    lv_style_set_border_width(&style, 0);
+    lv_style_set_pad_all(&style, 10);
+    lv_style_set_width(&style, 320);  // 设置宽
+    lv_style_set_height(&style, 240); // 设置高
+
+    /*Create an object with the new style*/
+    icon_in_obj = lv_obj_create(lv_scr_act());
+    lv_obj_add_style(icon_in_obj, &style, 0);
+
+    // 显示地理位置
+    lv_obj_t * addr_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(addr_label, &font_alipuhui20, 0);
+    lv_label_set_text(addr_label, "南京市|江宁区");
+    lv_obj_align_to(addr_label, icon_in_obj, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // 显示年月日
+    date_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(date_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(date_label, "%d年%02d月%02d日", timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday);
+    lv_obj_align_to(date_label, icon_in_obj, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    // 显示分割线
+    lv_obj_t * above_bar = lv_bar_create(icon_in_obj);
+    lv_obj_set_size(above_bar, 300, 3);
+    lv_obj_set_pos(above_bar, 0 , 30);
+    lv_bar_set_value(above_bar, 100, LV_ANIM_OFF);
+
+    // 显示天气图标
+    qweather_icon_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(qweather_icon_label, &font_qweather, 0);
+    lv_obj_set_pos(qweather_icon_label, 0 , 40);
+    lv_qweather_icon_show();
+
+    // 显示空气质量
+    static lv_style_t qair_level_style;
+    lv_style_init(&qair_level_style);
+    lv_style_set_radius(&qair_level_style, 10);  // 设置圆角半径
+    lv_style_set_bg_color(&qair_level_style, lv_palette_main(LV_PALETTE_GREEN)); // 绿色
+    lv_style_set_text_color(&qair_level_style, lv_color_hex(0xffffff)); // 白色
+    lv_style_set_border_width(&qair_level_style, 0);
+    lv_style_set_pad_all(&qair_level_style, 0);
+    lv_style_set_width(&qair_level_style, 50);  // 设置宽
+    lv_style_set_height(&qair_level_style, 26); // 设置高
+
+    qair_level_obj = lv_obj_create(icon_in_obj);
+    lv_obj_add_style(qair_level_obj, &qair_level_style, 0);
+    lv_obj_align_to(qair_level_obj, qweather_icon_label, LV_ALIGN_OUT_RIGHT_TOP, 5, 0);
+
+    qair_level_label = lv_label_create(qair_level_obj);
+    lv_obj_set_style_text_font(qair_level_label, &font_alipuhui20, 0);
+    lv_obj_align(qair_level_label, LV_ALIGN_CENTER, 0, 0);
+    lv_qair_level_show();
+
+    // 显示当天室外温度范围
+    qweather_temp_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(qweather_temp_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(qweather_temp_label, "%d~%d℃", qwdaily_tempMin, qwdaily_tempMax);
+    lv_obj_align_to(qweather_temp_label, qweather_icon_label, LV_ALIGN_OUT_RIGHT_MID, 5, 5);
+
+    // 显示当天天气图标代表的天气状况
+    qweather_text_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(qweather_text_label, &font_alipuhui20, 0);
+    lv_label_set_long_mode(qweather_text_label, LV_LABEL_LONG_SCROLL_CIRCULAR);     /*Circular scroll*/
+    lv_obj_set_width(qweather_text_label, 80);
+    lv_label_set_text_fmt(qweather_text_label, "%s", qwnow_text);
+    lv_obj_align_to(qweather_text_label, qweather_icon_label, LV_ALIGN_OUT_RIGHT_BOTTOM, 5, 0);
+    
+    // 显示时间  小时:分钟:秒钟
+    led_time_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(led_time_label, &font_led, 0);
+    lv_label_set_text_fmt(led_time_label, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    lv_obj_set_pos(led_time_label, 142, 42);
+
+    // 显示星期几
+    week_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(week_label, &font_alipuhui20, 0);
+    lv_obj_align_to(week_label, led_time_label, LV_ALIGN_OUT_BOTTOM_RIGHT, -10, 6);
+    lv_week_show();
+
+    // 显示日落时间 
+    sunset_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_font(sunset_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(sunset_label, "日落 %s", qwdaily_sunset);
+    lv_obj_set_pos(sunset_label, 200 , 103);
+
+    // 显示分割线
+    lv_obj_t * below_bar = lv_bar_create(icon_in_obj);
+    lv_obj_set_size(below_bar, 300, 3);
+    lv_obj_set_pos(below_bar, 0, 130);
+    lv_bar_set_value(below_bar, 100, LV_ANIM_OFF);
+
+    // 显示室外温湿度
+    static lv_style_t outdoor_style;
+    lv_style_init(&outdoor_style);
+    lv_style_set_radius(&outdoor_style, 10);  // 设置圆角半径
+    lv_style_set_bg_color(&outdoor_style, lv_color_hex(0xd8b010)); // 
+    lv_style_set_text_color(&outdoor_style, lv_color_hex(0xffffff)); // 白色
+    lv_style_set_border_width(&outdoor_style, 0);
+    lv_style_set_pad_all(&outdoor_style, 5);
+    lv_style_set_width(&outdoor_style, 100);  // 设置宽
+    lv_style_set_height(&outdoor_style, 80); // 设置高
+
+    lv_obj_t * outdoor_obj = lv_obj_create(icon_in_obj);
+    lv_obj_add_style(outdoor_obj, &outdoor_style, 0);
+    lv_obj_align(outdoor_obj, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_t *outdoor_th_label = lv_label_create(outdoor_obj);
+    lv_obj_set_style_text_font(outdoor_th_label, &font_alipuhui20, 0);
+    lv_label_set_text(outdoor_th_label, "室外");
+    lv_obj_align(outdoor_th_label, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *temp_symbol_label1 = lv_label_create(outdoor_obj);
+    lv_obj_set_style_text_font(temp_symbol_label1, &font_myawesome, 0);
+    lv_label_set_text(temp_symbol_label1, "\xEF\x8B\x88");  // 显示温度图标
+    lv_obj_align(temp_symbol_label1, LV_ALIGN_LEFT_MID, 10, 0);
+
+    outdoor_temp_label = lv_label_create(outdoor_obj);
+    lv_obj_set_style_text_font(outdoor_temp_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(outdoor_temp_label, "%d℃", qwnow_temp);
+    lv_obj_align_to(outdoor_temp_label, temp_symbol_label1, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    lv_obj_t *humi_symbol_label1 = lv_label_create(outdoor_obj);
+    lv_obj_set_style_text_font(humi_symbol_label1, &font_myawesome, 0);
+    lv_label_set_text(humi_symbol_label1, "\xEF\x81\x83");  // 显示湿度图标
+    lv_obj_align(humi_symbol_label1, LV_ALIGN_BOTTOM_LEFT, 10, 0);
+
+    outdoor_humi_label = lv_label_create(outdoor_obj);
+    lv_obj_set_style_text_font(outdoor_humi_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(outdoor_humi_label, "%d%%", qwnow_humi);
+    lv_obj_align_to(outdoor_humi_label, humi_symbol_label1, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    // 显示室内温湿度
+    static lv_style_t indoor_style;
+    lv_style_init(&indoor_style);
+    lv_style_set_radius(&indoor_style, 10);  // 设置圆角半径
+    lv_style_set_bg_color(&indoor_style, lv_color_hex(0xfe6464)); //
+    lv_style_set_text_color(&indoor_style, lv_color_hex(0xffffff)); // 白色
+    lv_style_set_border_width(&indoor_style, 0);
+    lv_style_set_pad_all(&indoor_style, 5);
+    lv_style_set_width(&indoor_style, 100);  // 设置宽
+    lv_style_set_height(&indoor_style, 80); // 设置高
+
+    lv_obj_t * indoor_obj = lv_obj_create(icon_in_obj);
+    lv_obj_add_style(indoor_obj, &indoor_style, 0);
+    lv_obj_align(indoor_obj, LV_ALIGN_BOTTOM_MID, 10, 0);
+
+    lv_obj_t *indoor_th_label = lv_label_create(indoor_obj);
+    lv_obj_set_style_text_font(indoor_th_label, &font_alipuhui20, 0);
+    lv_label_set_text(indoor_th_label, "室内");
+    lv_obj_align(indoor_th_label, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *temp_symbol_label2 = lv_label_create(indoor_obj);
+    lv_obj_set_style_text_font(temp_symbol_label2, &font_myawesome, 0);
+    lv_label_set_text(temp_symbol_label2, "\xEF\x8B\x88");  // 温度图标
+    lv_obj_align(temp_symbol_label2, LV_ALIGN_LEFT_MID, 10, 0);
+
+    indoor_temp_label = lv_label_create(indoor_obj);
+    lv_obj_set_style_text_font(indoor_temp_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(indoor_temp_label, "%d℃", temp_value);
+    lv_obj_align_to(indoor_temp_label, temp_symbol_label2, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    lv_obj_t *humi_symbol_label2 = lv_label_create(indoor_obj);
+    lv_obj_set_style_text_font(humi_symbol_label2, &font_myawesome, 0);
+    lv_label_set_text(humi_symbol_label2, "\xEF\x81\x83");  // 湿度图标
+    lv_obj_align(humi_symbol_label2, LV_ALIGN_BOTTOM_LEFT, 10, 0);
+
+    indoor_humi_label = lv_label_create(indoor_obj);
+    lv_obj_set_style_text_font(indoor_humi_label, &font_alipuhui20, 0);
+    lv_label_set_text_fmt(indoor_humi_label, "%d%%", humi_value);
+    lv_obj_align_to(indoor_humi_label, humi_symbol_label2, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    // 显示返回
+    static lv_style_t back_style;
+    lv_style_init(&back_style);
+    lv_style_set_radius(&back_style, 10);  // 设置圆角半径
+    lv_style_set_bg_color(&back_style, lv_color_hex(0x3E2723)); //
+    lv_style_set_text_color(&back_style, lv_color_hex(0xFFFFFF)); // 白色
+    lv_style_set_text_font(&back_style, &lv_font_montserrat_28);
+    lv_style_set_border_width(&back_style, 0);
+    lv_style_set_pad_all(&back_style, 5);
+    lv_style_set_width(&back_style, 100);  // 设置宽
+    lv_style_set_height(&back_style, 80); // 设置高
+
+    // 创建返回按钮
+    lv_obj_t *btn_back_obj = lv_btn_create(icon_in_obj);
+    lv_obj_add_style(btn_back_obj, &back_style, 0);
+    lv_obj_set_size(btn_back_obj, 80, 80);
+    lv_obj_align(btn_back_obj, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(btn_back_obj, btn_th_backmain_cb, LV_EVENT_CLICKED, NULL); // 添加按键处理函数
+
+    lv_obj_t *label_back_label = lv_label_create(btn_back_obj); 
+    lv_label_set_text(label_back_label, "BACK");  // 按键上显示左箭头符号
+    lv_obj_align(label_back_label, LV_ALIGN_CENTER, 0, 0);
+    
+    lvgl_port_unlock();
+}
+static void weather_page_task(void *pvParameters)
+{
+    lv_weather_page();
+    while(1)
+    {
+        vTaskDelay(100);
+    }
+    vTaskDelete(NULL);
+}
+
+static void th_event_handler(lv_event_t * e)
+{
+    // xTaskCreate(wifi_connect_task, "wifi_connect_task", 8192, NULL, 5, NULL);   // 一次性任务   连接WIFI
+    // xTaskCreate(get_time_task, "get_time_task", 8192, NULL, 5, NULL);           // 一次性任务   获取网络时间
+    // xTaskCreate(get_dwather_task, "get_dwather_task", 8192, NULL, 5, NULL);     // 一次性任务   获取每日天气信息
+    // xTaskCreate(get_rtweather_task, "get_rtweather_task", 8192, NULL, 5, NULL); // 一次性任务   获取实时天气信息
+    // xTaskCreate(get_airq_task, "get_airq_task", 8192, NULL, 5, NULL);     
+    xTaskCreate(weather_page_task, "weather_page_task", 8192, NULL, 5, NULL);         // 非一次性任务 主界面任务
+
+}
 
 /******************************** 主界面  ******************************/
 void Main_Page(void)
 {
     lvgl_port_lock(0);
-
-    // lv_obj_del(lckfb_logo);
     // 创建主界面基本对象
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xffffff), 0);
 
@@ -1212,68 +924,86 @@ void Main_Page(void)
     main_obj = lv_obj_create(lv_scr_act());
     lv_obj_add_style(main_obj, &style, 0);
 
-    // 显示右上角符号
-    lv_obj_t * sym_label_1 = lv_label_create(main_obj);
-    lv_obj_set_style_text_font(sym_label_1, &font_alipuhui20, 0);
-    lv_obj_set_style_text_color(sym_label_1, lv_color_hex(0xffffff), 0);
-    lv_label_set_text(sym_label_1, LV_SYMBOL_WIFI);  // 显示蓝牙和wifi图标
-    lv_obj_align_to(sym_label_1, main_obj, LV_ALIGN_TOP_RIGHT, -10, 10);
-
     // 显示左上角欢迎语
     main_text_label = lv_label_create(main_obj);
     lv_obj_set_style_text_font(main_text_label, &font_alipuhui20, 0);
     lv_label_set_long_mode(main_text_label, LV_LABEL_LONG_SCROLL_CIRCULAR);     /*Circular scroll*/
     lv_obj_set_width(main_text_label, 280);
-    lv_label_set_text(main_text_label, "This is a demo for studying...");
+    lv_label_set_text(main_text_label, "A demo for studying...");
     lv_obj_align_to(main_text_label, main_obj, LV_ALIGN_TOP_LEFT, 8, 5);
 
-    // 第一个应用-->WIFI
+    // 创建第1个应用图标--音乐
     lv_obj_t *icon1 = lv_btn_create(main_obj);
     lv_obj_add_style(icon1, &btn_style, 0);
-    lv_obj_set_style_bg_color(icon1, lv_color_hex(0xcd5c5c), 0);
+    lv_obj_set_style_bg_color(icon1, lv_color_hex(0xf87c30), 0);
     lv_obj_set_pos(icon1, 15, 50);
-    lv_obj_add_event_cb(icon1, wifiset_event_handler, LV_EVENT_CLICKED, NULL);
-
+    lv_obj_add_event_cb(icon1, music_event_handler, LV_EVENT_CLICKED, NULL);
+    
     lv_obj_t * img1 = lv_img_create(icon1);
-    LV_IMG_DECLARE(img_wifiset_icon);
-    lv_img_set_src(img1, &img_wifiset_icon);
+    LV_IMG_DECLARE(img_music_icon);
+    lv_img_set_src(img1, &img_music_icon);
     lv_obj_align(img1, LV_ALIGN_CENTER, 0, 0);
 
-    // 第2个应用-->Music
+    // 创建第2个应用图标--天气
     lv_obj_t *icon2 = lv_btn_create(main_obj);
     lv_obj_add_style(icon2, &btn_style, 0);
-    lv_obj_set_style_bg_color(icon2, lv_color_hex(0xf87c30), 0);
+    lv_obj_set_style_bg_color(icon2, lv_color_hex(0x3F51B5), 0);
     lv_obj_set_pos(icon2, 120, 50);
-    lv_obj_add_event_cb(icon2, music_event_handler, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(icon2, th_event_handler, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t * img2 = lv_img_create(icon2);
-    LV_IMG_DECLARE(img_music_icon);
-    lv_img_set_src(img2, &img_music_icon);
+    LV_IMG_DECLARE(img_th_icon);
+    lv_img_set_src(img2, &img_th_icon);
     lv_obj_align(img2, LV_ALIGN_CENTER, 0, 0);
 
-    // // 创建第3个应用图标
-    // lv_obj_t *icon3 = lv_btn_create(main_obj);
-    // lv_obj_add_style(icon3, &btn_style, 0);
-    // lv_obj_set_style_bg_color(icon3, lv_color_hex(0xd8b010), 0);
-    // lv_obj_set_pos(icon3, 225, 50);
-    // // lv_obj_add_event_cb(icon3, camera_event_handler, LV_EVENT_CLICKED, NULL);
+    // 创建第3个应用图标-->摄像头检测人脸
+    lv_obj_t *icon3 = lv_btn_create(main_obj);
+    lv_obj_add_style(icon3, &btn_style, 0);
+    lv_obj_set_style_bg_color(icon3, lv_color_hex(0xd8b010), 0);
+    lv_obj_set_pos(icon3, 225, 50);
+    // lv_obj_add_event_cb(icon3, camera_event_handler, LV_EVENT_CLICKED, NULL);
 
-    // lv_obj_t * img3 = lv_img_create(icon3);
-    // LV_IMG_DECLARE(img_spr_icon);
-    // lv_img_set_src(img3, &img_spr_icon);
-    // lv_obj_align(img3, LV_ALIGN_CENTER, 0, 0);
-
-    // // 创建第4个应用图标
-    // lv_obj_t *icon4 = lv_btn_create(main_obj);
-    // lv_obj_add_style(icon4, &btn_style, 0);
-    // lv_obj_set_style_bg_color(icon4, lv_color_hex(0x30a830), 0);
-    // lv_obj_set_pos(icon4, 15, 147);
-    // // lv_obj_add_event_cb(icon4, att_event_handler, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * img3 = lv_img_create(icon3);
+    LV_IMG_DECLARE(img_camera_icon);
+    lv_img_set_src(img3, &img_camera_icon);
+    lv_obj_align(img3, LV_ALIGN_CENTER, 0, 0);
     
-    // lv_obj_t * img4 = lv_img_create(icon4);
-    // LV_IMG_DECLARE(img_set_icon);
-    // lv_img_set_src(img4, &img_set_icon);
-    // lv_obj_align(img4, LV_ALIGN_CENTER, 0, 0);
+    // 创建第4个应用图标
+    lv_obj_t *icon4 = lv_btn_create(main_obj);
+    lv_obj_add_style(icon4, &btn_style, 0);
+    lv_obj_set_style_bg_color(icon4, lv_color_hex(0x7E57C2), 0);
+    lv_obj_set_pos(icon4, 15, 147);
+    // lv_obj_add_event_cb(icon4, att_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t * img4 = lv_img_create(icon4);
+    LV_IMG_DECLARE(img_spr_icon);
+    lv_img_set_src(img4, &img_spr_icon);
+    lv_obj_align(img4, LV_ALIGN_CENTER, 0, 0);
+
+    // 创建第5个应用图标-->设置
+    lv_obj_t *icon5 = lv_btn_create(main_obj);
+    lv_obj_add_style(icon5, &btn_style, 0);
+    lv_obj_set_style_bg_color(icon5, lv_color_hex(0x6D4C41), 0);
+    lv_obj_set_pos(icon5, 120, 147);
+    // lv_obj_add_event_cb(icon4, att_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t * img5 = lv_img_create(icon5);
+    LV_IMG_DECLARE(img_set_icon);
+    lv_img_set_src(img5, &img_set_icon);
+    lv_obj_align(img5, LV_ALIGN_CENTER, 0, 0);
+
+    
+    // 创建第6个应用图标--ABOUT
+    lv_obj_t *icon6 = lv_btn_create(main_obj);
+    lv_obj_add_style(icon6, &btn_style, 0);
+    lv_obj_set_style_bg_color(icon6, lv_color_hex(0x30a830), 0);
+    lv_obj_set_pos(icon6, 225, 147);
+    // lv_obj_add_event_cb(icon4, att_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t * img6 = lv_img_create(icon6);
+    LV_IMG_DECLARE(img_btset_icon);
+    lv_img_set_src(img6, &img_btset_icon);
+    lv_obj_align(img6, LV_ALIGN_CENTER, 0, 0);
 
     lvgl_port_unlock();
 }

@@ -5,15 +5,12 @@
         "IDF_TARGET": "esp32s3"
     },
     "idf.openOcdConfigs": [
-        "interface/ftdi/esp32_devkitj_v1.cfg",
-        "target/esp32s3.cfg"
+        "board/esp32s3-bridge.cfg"
     ],
     "files.associations": {
         "app_ui.h": "c",
         "esp32s3.h": "c",
-        "esp_camera.h": "c"
-    },
-    "idf.espIdfPathWin": "d:\\ESP\\v5.2.5\\esp-idf",
-    "idf.toolsPathWin": "d:\\ESP\\TOOL",
-    "idf.pythonInstallPath": "d:\\ESP\\TOOL\\tools\\idf-python\\3.11.2\\python.exe"
+        "esp_camera.h": "c",
+        "lv_font.h": "c"
+    }
 }
